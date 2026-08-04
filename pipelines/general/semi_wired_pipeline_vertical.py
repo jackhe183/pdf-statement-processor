@@ -3,7 +3,7 @@ from typing import Dict, Any
 import pdfplumber.page
 from core.base_pipeline import BasePipeline
 
-class SemiWiredPipelineHorizon(BasePipeline):
+class SemiWiredPipelineVertical(BasePipeline):
     def __init__(self, pdf_path):
         # 在这里告诉父类：这个银行找表头要用 "摘要" 这个词
         super().__init__(pdf_path, bank_name="semi_wired_bank")

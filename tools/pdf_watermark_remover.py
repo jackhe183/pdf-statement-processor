@@ -27,6 +27,7 @@ def _is_black_or_dark(color: Optional[Union[List, Tuple, int, float]], threshold
     for v in values:
         if v > 1.0:
             normalized_values.append(v / 255.0)
+
         else:
             normalized_values.append(v)
 

@@ -18,7 +18,7 @@ PROJECT_ROOT = pathlib.Path(__file__).parent.absolute()
 sys.path.append(str(PROJECT_ROOT))
 
 import config
-from tools.get_pipeline_class import get_pipeline_class
+from router.get_pipeline_class import get_pipeline_class
 
 # --- 初始化 ---
 app = FastAPI(title="PDF to Excel Processor", version="1.0")
