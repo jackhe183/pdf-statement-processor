@@ -5,6 +5,10 @@ __pycache__/
 *.so
 .Python
 
+# uv
+.venv/
+uv-python-cache/
+
 # IDE
 .idea/
 .vscode/
