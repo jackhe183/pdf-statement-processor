@@ -1,0 +1,58 @@
+import pdfplumber.page
+from typing import Dict
+
+
+class PDFStructureAnalyzer:
+    """
+    分析 PDF 页面的物理结构特征：
+    1. 有多少横线？
+    2. 有多少竖线？
+    3. 判定是全表格、半表格还是无表格。
+    """
+
+    @staticmethod
+    def analyze(page: pdfplumber.page.Page) -> Dict[str, bool]:
+        # 获取所有线条
+        lines = page.lines
+        # 也可以加入 rects 的边缘检测，如果表格是用矩形画的
+        # rects = page.rects
+
+        # 阈值：由经验决定，比如页面上至少有 3 条线才算有结构
+        MIN_LINE_COUNT = 3
+        MIN_LENGTH = 10  # 忽略噪点短线
+
+        horizontal_lines = 0
+        vertical_lines = 0
+
+        for line in lines:
+            length_x = abs(line['x1'] - line['x0'])
+            length_y = abs(line['bottom'] - line['top'])
+
+            # 判断横线: 宽度大，高度极小
+            if length_x > MIN_LENGTH and length_y < 2:
+                horizontal_lines += 1
+
+            # 判断竖线: 高度大，宽度极小
+            elif length_y > MIN_LENGTH and length_x < 2:
+                vertical_lines += 1
+
+        # 判定逻辑
+        has_horizontal = horizontal_lines > MIN_LINE_COUNT
+        has_vertical = vertical_lines > MIN_LINE_COUNT
+
+        # 结构类型判定
+        structure_type = "wireless"
+        if has_horizontal and has_vertical:
+            structure_type = "wired"  # 全网格
+        elif has_horizontal and not has_vertical:
+            structure_type = "semi_wired"  # 仅横线
+        elif not has_horizontal and has_vertical:
+            structure_type = "vertical"  # 仅竖线 (罕见，但存在)
+        else:
+            structure_type = "wireless"  # 无线
+
+        return {
+            "horizontal_count": horizontal_lines,
+            "vertical_count": vertical_lines,
+            "type": structure_type
+        }

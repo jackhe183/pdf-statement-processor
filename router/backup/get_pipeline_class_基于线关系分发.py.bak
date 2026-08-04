@@ -1,0 +1,74 @@
+
+import pathlib
+import pdfplumber
+import logging
+from typing import Type
+
+# --- 导入 Pipeline 类 ---
+from core.base_pipeline import BasePipeline
+from pipelines.specific.boc_pipeline import BOCPipeline
+from pipelines.general.wired_pipeline import WiredPipeline
+from pipelines.general.semi_wired_pipeline import SemiWiredPipeline
+from pipelines.general.semi_wired_pipeline_vertical import SemiWiredPipelineVertical
+from pipelines.general.wireless_pipeline import WirelessPipeline
+
+# --- 导入结构分析器 ---
+from router.structure_analyzer import PDFStructureAnalyzer
+
+# --- 配置区：特殊银行注册表 ---
+# 只有当某家银行的逻辑极其特殊，无法用通用 Pipeline 处理时，才在这里注册
+# 键：PDF 内容中包含的关键字（不是文件名！）
+# 值：Pipeline 类
+SPECIFIC_BANK_REGISTRY = {
+    "中国银行": BOCPipeline,
+    # "招商银行": CMBPipeline, # 如果你有的话
+}
+
+
+def get_pipeline_class(pdf_path: pathlib.Path) -> Type[BasePipeline]:
+    """
+    智能路由策略：
+    1. 【内容识别】：打开 PDF，提取文字，匹配特定银行关键字。
+    2. 【结构识别】：如果未匹配到特定银行，则分析第一页线条结构，自动降级到通用 Pipeline。
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                raise ValueError("PDF 文件为空或已损坏")
+
+            first_page = pdf.pages[0]
+
+            # --- 策略 1: 基于内容的特定银行匹配 ---
+            # 提取前 1000 个字符通常足够包含银行名称了
+            text_content = first_page.extract_text() or ""
+            # 简单清洗一下
+            text_content = text_content.replace(" ", "")
+
+            for keyword, pipeline_cls in SPECIFIC_BANK_REGISTRY.items():
+                if keyword in text_content:
+                    logging.info(f"🎯 [路由] 内容匹配成功: 发现 '{keyword}' -> 使用专属 {pipeline_cls.__name__}")
+                    return pipeline_cls
+
+            # --- 策略 2: 基于结构的通用匹配 (Fallback) ---
+            logging.info(f"🔍 [路由] 未匹配到专属银行，开始结构分析...")
+
+            analysis = PDFStructureAnalyzer.analyze(first_page)
+            structure_type = analysis["type"]
+
+            logging.info(
+                f"     📊 结构特征: 横线={analysis['horizontal_count']}, 竖线={analysis['vertical_count']} -> 类型: {structure_type}")
+
+            if structure_type == "wired":
+                return WiredPipeline
+            elif structure_type == "semi_wired":
+                return SemiWiredPipeline
+            elif structure_type == "vertical":
+                # 你之前的 SemiWiredPipelineVertical 适合这种或某些特殊排版
+                return SemiWiredPipelineVertical
+            else:
+                return WirelessPipeline
+
+    except Exception as e:
+        logging.error(f"❌ [路由] 无法自动判定 Pipeline: {e}")
+        # 最后的兜底，或者抛出异常
+        raise ValueError(f"无法为文件 {pdf_path.name} 分配 Pipeline。错误: {e}")

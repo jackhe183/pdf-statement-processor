@@ -1,0 +1,183 @@
+# tools/table_footer/footer_finder.py
+
+# 用途：用于智能识别 PDF 表格的底部边界（Footer），支持稀疏度扫描、ROI 辅助及正则关键字匹配。
+# 注意：依赖 pdfplumber 提取的 page 对象。
+
+# --- 标准库导入 ---
+import logging
+import re
+from typing import Optional, List, Dict, Any, Pattern
+
+# --- 第三方库导入 ---
+import pdfplumber.page
+
+# --- 配置区 ---
+# 定义页脚特征的正则表达式列表
+# 使用 \s* 忽略空格，re.IGNORECASE 忽略大小写
+FOOTER_PATTERNS: List[Pattern] = [
+    re.compile(r'第\s*\d+\s*页', re.IGNORECASE),
+    re.compile(r'共\s*\d+\s*页', re.IGNORECASE),
+    re.compile(r'Page\s*\d+\s*of\s*\d+', re.IGNORECASE),
+    re.compile(r'打印时间', re.IGNORECASE),
+    re.compile(r'打印日期', re.IGNORECASE),
+    re.compile(r'制表人', re.IGNORECASE),
+    re.compile(r'操作员', re.IGNORECASE),
+    re.compile(r'审核', re.IGNORECASE),
+    # 注意：合计通常是表格最后一行，如果需要保留合计在表格内，请注释掉下面这行
+    re.compile(r'合计', re.IGNORECASE),
+    re.compile(r'总金额', re.IGNORECASE),
+    re.compile(r'重要提示', re.IGNORECASE),
+
+]
+
+
+# --- 函数定义区 ---
+
+def find_table_bottom_comprehensive(page: pdfplumber.page.Page,
+                                    header_top: float,
+                                    roi_bbox: Optional[List[float]] = None,
+                                    sparsity_threshold: float = 20.0) -> float:
+    """
+    综合多种策略寻找表格底部 (Bottom)。
+
+    优先级策略：
+    1. 【智能扫描 (Sparsity)】：优先寻找显著的行间距断层。
+    2. 【ROI 兜底】：如果提供了检测框，且无断层，使用检测框底边。
+    3. 【字段匹配 (Regex)】：如果前两者失效，扫描特定页脚关键字（如页码），取其上沿中点。
+    4. 【全页兜底】：实在没办法了，返回页面高度。
+
+    Args:
+        page: PDF 页面对象
+        header_top: 表头的 Top 坐标（扫描起始点）
+        roi_bbox: [x0, top, x1, bottom] 模型预测的物理框（备胎）
+        sparsity_threshold: 稀疏阈值，行间距超过此值视为断层
+
+    Returns:
+        float: 建议裁剪的 bottom 坐标。
+    """
+    # --- 1. 数据准备 ---
+    # 提取页面所有文字
+    words = page.extract_words(x_tolerance=2, y_tolerance=2)
+
+    if not words:
+        return _fallback_full_page(page.height)
+
+    # 将文字聚类成行： {top_int: [word_dict, ...]}
+    rows_map: Dict[int, List[Dict[str, Any]]] = {}
+    for w in words:
+        y_key = round(w['top'])
+        if y_key not in rows_map:
+            rows_map[y_key] = []
+        rows_map[y_key].append(w)
+
+    # 获取排序后的行坐标 (从上到下)，且只关注表头下方的行
+    sorted_y_keys = sorted(rows_map.keys())
+    candidate_rows_y = [y for y in sorted_y_keys if y > header_top + 2]
+
+    if not candidate_rows_y:
+        logging.info("     ⚠️ [FooterFinder] 表头下方无内容，尝试兜底逻辑。")
+        return _attempt_fallback_chain(roi_bbox, page.height)
+
+    # --- 2. 策略一：智能扫描 (Sparsity Scan) ---
+    logging.info("     🔍 [FooterFinder] 启动策略一：智能稀疏度扫描...")
+
+    # 遍历行寻找断层
+    for i in range(len(candidate_rows_y) - 1):
+        current_row_top = candidate_rows_y[i]
+        next_row_top = candidate_rows_y[i + 1]
+
+        # 当前行的实体底边 (考虑到字号大小不同，取 max bottom)
+        current_row_words = rows_map[current_row_top]
+        current_row_bottom = max(w['bottom'] for w in current_row_words)
+
+        # 计算 Gap
+        gap = next_row_top - current_row_bottom
+
+        if gap > sparsity_threshold:
+            cutoff_y = current_row_bottom + 5  # 留少许余量
+            logging.info(
+                f"     ✂️ [FooterFinder] 智能锁定: 在 Y={current_row_top} 后发现断层 (Gap={gap:.2f})，Bottom={cutoff_y:.2f}"
+            )
+            return cutoff_y
+
+    # 如果智能扫描跑完了所有行都没发现断层（说明表格很密，或者延伸到了页底）
+
+    # 检查优先级 2: Regex 字段匹配
+    logging.info("     🛡️ [FooterFinder] 策略二未命中 (无 ROI)，启动策略三：关键字正则匹配...")
+    regex_cutoff = _find_bottom_by_keywords(candidate_rows_y, rows_map)
+    if regex_cutoff:
+        return regex_cutoff
+
+    # 检查优先级 3: ROI
+    if roi_bbox:
+        logging.info(f"     🛡️ [FooterFinder] 策略二命中: 使用 ROI 物理框底线: {roi_bbox[3]:.2f}")
+        return roi_bbox[3]
+
+    # --- 4. 策略四：全页兜底 ---
+    return _fallback_full_page(page.height)
+
+
+def _find_bottom_by_keywords(candidate_rows_y: List[int],
+                             rows_map: Dict[int, List[Dict[str, Any]]]) -> Optional[float]:
+    """
+    内部辅助：通过正则寻找页脚关键字。
+    返回：分割线坐标 (float) 或 None
+    """
+    # 从下往上找可能更高效，但也可能先遇到“制表人”再遇到“页码”。
+    # 为了逻辑简单且符合从上到下的阅读顺序，我们顺序遍历。
+    # 只要发现任一“页脚特征行”，就认为表格结束了。
+
+    for i, y_key in enumerate(candidate_rows_y):
+        row_words = rows_map[y_key]
+        # 拼接该行文本
+        row_text = "".join([w['text'] for w in row_words])
+
+        # 检查是否匹配任一特征
+        is_footer = False
+        for pattern in FOOTER_PATTERNS:
+            if pattern.search(row_text):
+                logging.info(
+                    f"     🧩 [FooterFinder] 正则捕获: 在 Y={y_key} 发现关键字 '{pattern.pattern}' -> 内容: {row_text}")
+                is_footer = True
+                break
+
+        if is_footer:
+            # 找到页脚行了。
+            # 分割线位置 = (当前页脚行Top + 上一行Bottom) / 2
+            # 如果这是第一行（i=0），说明整个candidate都是页脚，直接切在header下面一点
+            if i == 0:
+                # 这种情况极少，取当前行 Top - 2
+                return float(y_key - 2)
+
+            # 获取上一行的数据
+            prev_row_top = candidate_rows_y[i - 1]
+            prev_row_words = rows_map[prev_row_top]
+            prev_row_bottom = max(w['bottom'] for w in prev_row_words)
+
+            current_row_top = min(w['top'] for w in row_words)  # 当前行的最顶部
+
+            # 计算中点
+            mid_point = (prev_row_bottom + current_row_top) / 2
+            logging.info(
+                f"     ✂️ [FooterFinder] 字段截断: 坐标定位于上一行底 ({prev_row_bottom:.2f}) 与页脚顶 ({current_row_top:.2f}) 之间 -> {mid_point:.2f}")
+            return mid_point
+
+    return None
+
+
+def _attempt_fallback_chain(roi_bbox: Optional[List[float]], page_height: float) -> float:
+    """内部辅助：处理无内容时的兜底链"""
+    if roi_bbox:
+        logging.info(f"     🛡️ [FooterFinder] 无文本内容，使用 ROI 底线: {roi_bbox[3]:.2f}")
+        return roi_bbox[3]
+    return _fallback_full_page(page_height)
+
+
+def _fallback_full_page(page_height: float) -> float:
+    """内部辅助：最终兜底"""
+    logging.info(f"     🛡️ [FooterFinder] 所有策略失效，使用页面高度: {page_height:.2f}")
+    return float(page_height)
+
+
+# 为了兼容旧代码的调用习惯，可以将旧函数名指向新函数
+find_table_bottom_by_sparsity = find_table_bottom_comprehensive

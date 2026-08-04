@@ -1,0 +1,70 @@
+# tools/footer_finder.py
+import pdfplumber.page
+import logging
+
+
+def find_table_bottom_by_sparsity(page: pdfplumber.page.Page,
+                                  sparsity_threshold: float = 20.0) -> float:
+    """
+    通过行间距稀疏度判断表尾。
+
+    原理：
+    表格主体部分的行间距通常比较紧密且均匀。
+    表格结束后的备注、印章、页码通常与最后一行数据有较大的空隙。
+
+    Args:
+        page: PDF 页面对象
+        sparsity_threshold: 稀疏阈值，两行由于 top 差值超过此值，视为断层。
+
+    Returns:
+        float: 建议裁剪的 bottom 坐标。
+    """
+    words = page.extract_words()
+    if not words:
+        return page.height
+
+    # 1. 将单词按 Y 坐标聚类成行
+    # 使用 round 将近似 y 的词归为一行
+    rows_map = {}
+    for w in words:
+        y_key = round(w['top'])
+        if y_key not in rows_map:
+            rows_map[y_key] = []
+        rows_map[y_key].append(w)
+
+    # 获取每一行的代表 Y 坐标 (top)
+    sorted_y_keys = sorted(rows_map.keys())
+
+    if len(sorted_y_keys) < 2:
+        return page.height
+
+    # 2. 计算行间距 (Gap)
+    # 寻找第一个巨大的跳跃点 (Gap > Threshold)
+    # 为了避免切掉表格内部的宽行，我们通常从页面中部开始往下找，或者假定表格至少有几行
+
+    cutoff_y = page.height  # 默认不切
+
+    # 从上往下扫描间距
+    # 我们可以忽略页面头部的前几行（假设是表头）
+    start_idx = min(5, len(sorted_y_keys) - 1)
+
+    for i in range(start_idx, len(sorted_y_keys) - 1):
+        current_row_top = sorted_y_keys[i]
+        next_row_top = sorted_y_keys[i + 1]
+
+        # 计算当前行的底部 (bottom)
+        current_row_words = rows_map[current_row_top]
+        current_row_bottom = max([w['bottom'] for w in current_row_words])
+
+        # 间距 = 下一行顶部 - 当前行底部
+        gap = next_row_top - current_row_bottom
+
+        if gap > sparsity_threshold:
+            # 发现断层！认为这里是表尾
+            # 切割点设在当前行底部 + 一点余量
+            cutoff_y = current_row_bottom + 5
+            logging.info(
+                f"     ✂️ [FooterFinder] 检测到行间距 {gap:.2f} > {sparsity_threshold}，判定为表尾，Bottom={cutoff_y:.2f}")
+            break
+
+    return cutoff_y

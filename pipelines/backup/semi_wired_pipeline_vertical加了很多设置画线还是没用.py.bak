@@ -1,0 +1,112 @@
+# pipelines/general/semi_wired_pipeline_vertical.py
+
+from typing import Dict, Any, List, Optional, Tuple
+import logging
+import pdfplumber.page
+from core.base_pipeline import BasePipeline
+from tools.table_header.header_finder import find_header_position
+
+
+class SemiWiredPipelineVertical(BasePipeline):
+    def __init__(self, pdf_path):
+        super().__init__(pdf_path, bank_name="semi_wired_bank_vertical", header_keywords=["摘要", "交易日期", "日期"])
+
+    # --- 1. 重写定位逻辑：主动留出呼吸空间 ---
+    def calculate_crop_bbox(self, page: pdfplumber.page.Page) -> Optional[Tuple[float, float, float, float]]:
+        """
+        重写父类逻辑。
+        目的：在计算裁切框时，故意把 Top 往上提 10px。
+        这样 target_page 就不会紧贴着字头，而是有一点留白，既防止切字，又方便后续 _generate_header_based_verticals 操作。
+        """
+        # 复用父类的计算逻辑，拿到标准的 (x0, top, x1, bottom)
+        bbox = super().calculate_crop_bbox(page)
+
+        if bbox:
+            x0, top, x1, bottom = bbox
+            # 关键修改：Top 向上扩展 10pt (注意不要小于0)
+            padded_top = max(0, top - 10)
+            logging.info(f"     📐 [Vertical优化] 为表头预留呼吸空间: 原Top={top:.2f} -> 新Top={padded_top:.2f}")
+            return (x0, padded_top, x1, bottom)
+
+        return None
+
+    # --- 2. 修正动态画线逻辑：尊重页面边界 ---
+    def _generate_header_based_verticals(self, page: pdfplumber.page.Page) -> List[float]:
+        """
+        基于表头文字动态计算垂直分割线。
+        """
+        # page 已经是裁切过的 target_page (现在它包含了表头上方 10px 的空白)
+
+        # 获取当前页面的绝对顶部坐标
+        current_page_top = page.bbox[1]
+
+        # 我们只需要截取当前页面最顶部的 40px 区域作为“表头带”
+        # 不需要再调用 find_header_position 去找坐标了，因为我们确信表头就在最上面
+        strip_top = current_page_top
+        strip_bottom = min(page.bbox[3], current_page_top + 40)
+
+        # 执行裁切
+        header_strip = page.crop((0, strip_top, page.width, strip_bottom))
+
+        # 提取文字 (使用较大的 tolerance 粘合表头词组)
+        words = header_strip.extract_words(x_tolerance=10, keep_blank_chars=False)
+
+        if not words:
+            logging.warning("     ⚠️ 表头区域全白，无法生成动态竖线。")
+            return []
+
+        # 按 x0 排序
+        words.sort(key=lambda w: w['x0'])
+
+        # 计算垂直线
+        vertical_lines = [0]
+
+        for i in range(len(words) - 1):
+            current_word = words[i]
+            next_word = words[i + 1]
+
+            mid_point = (current_word['x1'] + next_word['x0']) / 2
+
+            # 防止粘连：间距大于 2px 才画线
+            if next_word['x0'] - current_word['x1'] > 2:
+                vertical_lines.append(mid_point)
+
+        vertical_lines.append(page.width)
+
+        logging.info(f"     📏 [加强版] 基于表头动态生成了 {len(vertical_lines)} 条竖线 (捕捉到 {len(words)} 个表头词)。")
+        return vertical_lines
+
+    def get_extract_settings(self, page: pdfplumber.page.Page) -> Dict[str, Any]:
+
+        # 策略 A: 物理竖线检测
+        vertical_lines_objs = [
+            l for l in page.lines
+            if abs(l['x0'] - l['x1']) < 2 and (l['bottom'] - l['top']) > 10
+        ]
+
+        if len(vertical_lines_objs) > 5:
+            logging.info(f"     👀 检测到 {len(vertical_lines_objs)} 条物理竖线 -> 切换为 'lines' 策略")
+            return {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "snap_tolerance": 3,
+                "intersection_x_tolerance": 10,
+                "join_tolerance": 5,
+            }
+
+        # 策略 B: 表头动态画线
+        logging.info("     👀 未检测到足够物理竖线 -> 启用 '表头动态锚定' 策略")
+        dynamic_lines = self._generate_header_based_verticals(page)
+
+        settings = {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 5,
+            "min_words_vertical": 1,
+        }
+
+        if dynamic_lines:
+            settings["vertical_strategy"] = "explicit"
+            settings["explicit_vertical_lines"] = dynamic_lines
+
+        return settings

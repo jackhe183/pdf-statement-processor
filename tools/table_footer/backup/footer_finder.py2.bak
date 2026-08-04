@@ -1,0 +1,90 @@
+# tools/table_footer/footer_finder.py
+import pdfplumber.page
+import logging
+from typing import Optional, List
+
+
+def find_table_bottom_by_sparsity(page: pdfplumber.page.Page,
+                                  header_top: float,
+                                  roi_bbox: Optional[List[float]] = None,
+                                  sparsity_threshold: float = 20.0) -> float:
+    """
+    通过行间距稀疏度判断表尾 (Bottom)。
+
+    核心逻辑：
+    1. 【智能扫描】：从 header_top (表头) 开始向下顺序扫描每一行。
+       寻找行与行之间 间距(Gap) > threshold 的断层。
+       一旦找到，该断层上方即为表格主体，下方为页脚。
+    2. 【ROI兜底】：只有当智能扫描未发现任何断层时，才信赖 roi_bbox[3]。
+    3. 【全页兜底】：最后返回 page.height。
+
+    Args:
+        page: PDF 页面对象
+        header_top: 表头的 Top 坐标（扫描起始点）
+        roi_bbox: [x0, top, x1, bottom] 物理框（仅作备胎）
+        sparsity_threshold: 稀疏阈值
+
+    Returns:
+        float: 建议裁剪的 bottom 坐标。
+    """
+    # --- 1. 准备数据 ---
+    # 提取页面所有文字，容差设小一点以保证行归类准确
+    words = page.extract_words(x_tolerance=2, y_tolerance=2)
+
+    # 如果没字，直接跳到底线逻辑
+    if not words:
+        return _fallback_bottom(roi_bbox, page.height)
+
+    # --- 2. 聚类成行 ---
+    rows_map = {}
+    for w in words:
+        y_key = round(w['top'])
+        if y_key not in rows_map: rows_map[y_key] = []
+        rows_map[y_key].append(w)
+
+    # 按 Y 坐标排序 (从上到下)
+    sorted_y_keys = sorted(rows_map.keys())
+
+    # --- 3. 【智能扫描】 核心进攻逻辑 ---
+    # 过滤：只保留 Header 这一行下面的行
+    # 我们不需要扫描表头上面的东西，也不需要扫描表头本身
+    candidate_rows_y = [y for y in sorted_y_keys if y > header_top + 2]
+
+    if len(candidate_rows_y) < 1:
+        logging.info("     ⚠️ [FooterFinder] 表头下方无内容，使用兜底逻辑。")
+        return _fallback_bottom(roi_bbox, page.height)
+
+    # 开始顺序扫描
+    for i in range(len(candidate_rows_y) - 1):
+        current_row_top = candidate_rows_y[i]
+        next_row_top = candidate_rows_y[i + 1]
+
+        # 获取当前行实体内容的底部 (bottom)
+        # 注意：不能只用 top，因为有些字很大
+        current_row_words = rows_map[current_row_top]
+        current_row_bottom = max([w['bottom'] for w in current_row_words])
+
+        # 计算空隙：下一行的顶 - 当前行的底
+        gap = next_row_top - current_row_bottom
+
+        # 判定：如果空隙超过阈值，视为“最大且显著”的分割点
+        # 这里取“第一个”超过阈值的点，因为表格主体通常是连续的，一旦断开就是表尾
+        if gap > sparsity_threshold:
+            cutoff_y = current_row_bottom + 5  # 稍微留一点余量
+            logging.info(
+                f"     ✂️ [FooterFinder] 智能锁定: 在 Y={current_row_top} 后发现断层 (Gap={gap:.2f})，Bottom={cutoff_y:.2f}")
+            return cutoff_y
+
+    # --- 4. 扫描结束未发现断层，启用防守逻辑 ---
+    logging.info("     🛡️ [FooterFinder] 智能扫描未发现断层 (表格可能延伸至页底)，启用 ROI 兜底。")
+    return _fallback_bottom(roi_bbox, page.height)
+
+
+def _fallback_bottom(roi_bbox: Optional[List[float]], page_height: float) -> float:
+    """内部辅助：退路逻辑"""
+    if roi_bbox:
+        # 这里的 roi_bbox[3] 是 find_tables 找到的物理底线
+        logging.info(f"     🛡️ [FooterFinder] 使用物理框底线: {roi_bbox[3]:.2f}")
+        return roi_bbox[3]
+
+    return page_height

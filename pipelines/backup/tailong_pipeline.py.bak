@@ -1,0 +1,109 @@
+# pipelines/tailong_pipeline.py
+from core.base_pipeline import BasePipeline
+import pdfplumber.page
+import pandas as pd
+import logging
+from typing import List, Optional, Dict, Any
+
+
+class TailongPipeline(BasePipeline):
+    def __init__(self, pdf_path):
+        super().__init__(pdf_path, bank_name="tailong")
+
+    # 定义标准表头 (根据你的 Excel 截图)
+    # 确保这里的列数和 extract_tables 提取出来的列数一致
+    STANDARD_HEADERS = ["序号", "交易日期", "币种", "交易金额", "账户余额", "摘要/备注", "对方账号/户名"]
+
+    def get_locate_settings(self, page) -> Dict[str, Any]:
+        """[定位配置] 找物理边框"""
+        return {
+            "vertical_strategy": "lines",
+            "horizontal_strategy": "lines",
+            "snap_tolerance": 5,
+        }
+
+    def get_extract_settings(self, page) -> Dict[str, Any]:
+        """[提取配置]"""
+        return {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 5,
+            "intersection_x_tolerance": 10,
+        }
+
+    def locate_roi(self, page) -> Optional[List[float]]:
+        settings = self.get_locate_settings(page)
+        tables = page.find_tables(table_settings=settings)
+        if tables:
+            return max(tables, key=lambda t: (t.bbox[2] - t.bbox[0]) * (t.bbox[3] - t.bbox[1])).bbox
+        return None
+
+    def crop_page(self, page: pdfplumber.page.Page, roi_bbox: Optional[List[float]]) -> pdfplumber.page.Page:
+        # 如果 locate_roi 找到了框，优先用框 (这样最稳，不会切掉表头)
+        if roi_bbox:
+            return page.crop(roi_bbox)
+
+        # 兜底逻辑：如果没找到框，切除页眉页脚
+        words = page.extract_words()
+        width = page.width
+        height = page.height
+
+        # [调整] 之前 top=0.1 可能太狠了，切掉了第二页的表头
+        # 改为 0.05 (5%) 或者如果不确定，可以设为 0，靠 clean_data 去洗
+        top = height * 0.05
+        bottom = height * 0.95
+
+        sorted_words = sorted(words, key=lambda w: w['bottom'], reverse=True)
+        if sorted_words:
+            last_word = sorted_words[0]
+            if last_word['top'] > height * 0.9:
+                bottom = last_word['top'] - 5
+                logging.info(f"     ✂️ [Tailong] 智能剔除页脚，Bottom调整为: {bottom:.2f}")
+
+        return page.crop([0, top, width, bottom])
+
+    def clean_data(self, tables: List[List[List[str]]]) -> pd.DataFrame:
+        """
+        [单页清洗]
+        核心修复：强制统一列名，解决 0,1,2,3... 问题
+        """
+        all_rows = [row for table in tables for row in table]
+        if not all_rows: return pd.DataFrame()
+
+        df = pd.DataFrame(all_rows)
+
+        # 1. 尝试在数据中找表头行 (为了去除它)
+        header_idx = -1
+        for i, row in df.iterrows():
+            row_str = "".join([str(x) for x in row if x])
+            if "序号" in row_str and "交易" in row_str:
+                header_idx = i
+                break
+
+        # 2. 如果找到了表头行，剔除它及其之上的行
+        if header_idx != -1:
+            # 注意：我们不再使用 df.columns = df.iloc[header_idx]
+            # 因为 OCR 可能会把 "交易日期" 识别错，导致列名不统一
+            df = df.iloc[header_idx + 1:]
+
+        # 3. 过滤掉内容也是 "序号" 的重复表头行 (跨页常见)
+        # 此时 df 可能还是 0, 1, 2 列名
+        # 我们检查第一列的值
+        if not df.empty:
+            # 假设第一列是序号
+            first_col = df.columns[0]
+            df = df[df[first_col] != "序号"]
+
+        # 4. [关键修复] 强制统一列名
+        # 只有当列数匹配时才赋值，防止报错
+        current_col_count = len(df.columns)
+        expected_col_count = len(self.STANDARD_HEADERS)
+
+        if current_col_count == expected_col_count:
+            df.columns = self.STANDARD_HEADERS
+        else:
+            logging.warning(
+                f"     ⚠️ [Tailong] 列数不匹配 (提取:{current_col_count} vs 标准:{expected_col_count})，保持默认列名。这可能导致合并错位。")
+            # 可以在这里做一些补救，比如补齐空列，或者截断
+
+        return df
